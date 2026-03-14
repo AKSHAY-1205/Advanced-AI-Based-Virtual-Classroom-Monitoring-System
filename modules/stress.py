@@ -1,21 +1,40 @@
 import cv2
 import numpy as np
+import threading
 import tensorflow as tf
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
 # ================= CONSTANTS =================
-# These match EXACTLY the working real-time notebook
 
 IMG_SIZE         = 224
-THRESHOLD        = 0.65      # same as working notebook
-SMOOTHING_FRAMES = 10        # same as working notebook
+MODEL_THRESHOLD  = 0.65
+SMOOTHING_FRAMES = 8
 
-# MediaPipe secondary signal weight
-# Model is primary — MediaPipe only nudges when model is borderline
-# If model pred is 0.55–0.75 (borderline), MediaPipe can shift decision
-BORDERLINE_LOW   = 0.55
-BORDERLINE_HIGH  = 0.75
-MP_NUDGE         = 0.08      # how much MediaPipe shifts score when borderline
+# Stress requires BOTH:
+#   a) model prediction > MODEL_THRESHOLD
+#   b) at least MIN_CUES MediaPipe stress cues firing simultaneously
+# This prevents false positives from either signal alone
+MIN_CUES_FOR_STRESS = 2      # minimum cues needed alongside model signal
+MP_ONLY_THRESHOLD   = 4      # if 4+ cues fire, stress even without model
+
+# ---- MediaPipe thresholds — conservative to avoid false triggers ----
+
+# Eye squint: eyes genuinely narrowed (not just natural eye shape)
+# Normal relaxed EAR ~ 0.28–0.35. Squinting < 0.18 is clearly visible
+EYE_SQUINT_THRESHOLD   = 0.18   # deliberately low — only catch real squinting
+
+# Brow furrow: inner brows genuinely close
+# Normal brow distance ~ 0.10–0.15 of face width
+BROW_FURROW_THRESHOLD  = 0.075  # only trigger on clear furrowing
+
+# Mouth open (tension/distress): clearly open mouth
+MOUTH_OPEN_THRESHOLD   = 0.10   # 10% of face height — clearly open
+
+# Lip compression: very tight pressed lips
+LIP_THIN_THRESHOLD     = 0.020  # only very compressed lips
+
+# Nose flare: clearly wider than normal
+NOSE_FLARE_THRESHOLD   = 0.22
 
 FONT             = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE       = 0.75
@@ -33,7 +52,6 @@ def _build_stress_architecture():
     from tensorflow.keras.applications import MobileNetV2
     from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
     from tensorflow.keras.models import Model
-
     base   = MobileNetV2(weights=None, include_top=False, input_shape=(224, 224, 3))
     x      = base.output
     x      = GlobalAveragePooling2D()(x)
@@ -59,153 +77,169 @@ def load_model_compatible(model_path, architecture_fn):
             raise e
 
 
-# ================= MEDIAPIPE STRESS CUES (silent) =================
+# ================= EXPRESSION ANALYSER =================
 
-class _FacialStressAnalyser:
+class _ExpressionAnalyser:
     """
-    Analyses FaceMesh landmarks for stress-related facial expressions.
-    Used as a SECONDARY signal only — nudges borderline model predictions.
-    NEVER shown on screen.
-
-    Stress cues checked:
-      1. Lip compression   — tight lips (reduced inner lip gap)
-      2. Brow furrow       — inner brows pulled together
-      3. Jaw clench        — minimal mouth opening
-      4. Mouth corner drop — corners pulled down
-      5. Nose flare        — alar width increase
+    Counts how many stress cues are simultaneously active.
+    Returns (cue_count: int, cues: list).
+    Uses conservative thresholds — only fires on clearly visible expressions.
     """
 
-    # Landmark-based thresholds
-    LIP_COMPRESS_THRESHOLD = 0.025
-    BROW_FURROW_THRESHOLD  = 0.085
-    JAW_CLENCH_THRESHOLD   = 0.018
-    MOUTH_CORNER_DROP      = 0.005
-    NOSE_FLARE_THRESHOLD   = 0.20
+    def _ear(self, lm, p1, p2, p3, p4, p5, p6):
+        v1 = np.linalg.norm([lm[p2].x - lm[p6].x, lm[p2].y - lm[p6].y])
+        v2 = np.linalg.norm([lm[p3].x - lm[p5].x, lm[p3].y - lm[p5].y])
+        h  = np.linalg.norm([lm[p1].x - lm[p4].x, lm[p1].y - lm[p4].y])
+        return (v1 + v2) / (2.0 * h + 1e-6)
 
     def analyse(self, mesh_results):
         """
-        Returns stress_score in [0.0, 1.0].
-        0.0 = no stress cues, 1.0 = all stress cues firing.
-        Returns 0.5 (neutral) if no face found — won't influence model.
+        Returns (cue_count: int, cues_fired: list)
+        0 cues = calm expression. 2+ cues = stress expression visible.
         """
         if not mesh_results or not mesh_results.multi_face_landmarks:
-            return 0.5   # neutral — no influence on model
+            return 0, []
 
         lm     = mesh_results.multi_face_landmarks[0].landmark
-        score  = 0.0
-        cues   = 0
+        cues   = []
 
-        # Reference measurements
         face_h = abs(lm[10].y - lm[152].y)
         face_w = abs(lm[454].x - lm[234].x)
-
         if face_h < 0.01 or face_w < 0.01:
-            return 0.5
+            return 0, []
 
-        # 1. Lip compression
-        lip_gap = abs(lm[14].y - lm[13].y) / face_h
-        if lip_gap < self.LIP_COMPRESS_THRESHOLD:
-            score += 0.25
-            cues  += 1
+        # 1. Eye squint — both eyes clearly narrowed
+        left_ear  = self._ear(lm, 33,  160, 158, 133, 153, 144)
+        right_ear = self._ear(lm, 362, 385, 387, 263, 373, 380)
+        avg_ear   = (left_ear + right_ear) / 2.0
+        if avg_ear < EYE_SQUINT_THRESHOLD:
+            cues.append("eye_squint")
 
-        # 2. Brow furrow
+        # 2. Brow furrow — clearly pulled together
         brow_dist = abs(lm[285].x - lm[55].x) / face_w
-        if brow_dist < self.BROW_FURROW_THRESHOLD:
-            score += 0.25
-            cues  += 1
+        if brow_dist < BROW_FURROW_THRESHOLD:
+            cues.append("brow_furrow")
 
-        # 3. Jaw clench
+        # 3. Mouth open (distress/tension)
         mouth_open = abs(lm[17].y - lm[0].y) / face_h
-        if mouth_open < self.JAW_CLENCH_THRESHOLD:
-            score += 0.20
-            cues  += 1
+        if mouth_open > MOUTH_OPEN_THRESHOLD:
+            cues.append("mouth_open")
 
-        # 4. Mouth corner drop
-        mouth_mid_y = (lm[0].y + lm[17].y) / 2.0
-        if (lm[61].y - mouth_mid_y > self.MOUTH_CORNER_DROP or
-                lm[291].y - mouth_mid_y > self.MOUTH_CORNER_DROP):
-            score += 0.15
-            cues  += 1
+        # 4. Lip compression
+        lip_gap = abs(lm[14].y - lm[13].y) / face_h
+        if lip_gap < LIP_THIN_THRESHOLD:
+            cues.append("lip_compress")
 
         # 5. Nose flare
         alar_w = abs(lm[358].x - lm[129].x) / face_w
-        if alar_w > self.NOSE_FLARE_THRESHOLD:
-            score += 0.15
-            cues  += 1
+        if alar_w > NOSE_FLARE_THRESHOLD:
+            cues.append("nose_flare")
 
-        return min(1.0, score)
+        return len(cues), cues
 
 
 # ================= STRESS DETECTOR =================
 
 class StressDetector:
     """
-    Stress detection matching the working real-time notebook exactly:
-      - Full frame passed to model (NO face crop — model trained on full frames)
-      - preprocess_input scaling (matches notebook inference)
-      - Threshold 0.65, smoothing 10 frames
+    Threaded stress detector — model inference runs in background thread
+    so it NEVER blocks the video loop.
 
-    MediaPipe facial cues act as a SECONDARY nudge only:
-      - Only applied when model prediction is borderline (0.55–0.75)
-      - If model is clearly STRESS (>0.75) or clearly NO STRESS (<0.55),
-        MediaPipe has zero influence
-      - Nothing about MediaPipe shown on screen
+    Decision logic (prevents false positives):
+      STRESS if:
+        (model_pred > 0.65  AND  cue_count >= 2)   ← both agree
+        OR
+        (cue_count >= 4)                             ← overwhelming expression signal
+
+      NO STRESS otherwise — single cue alone never triggers stress
+
+    Model preprocessing exactly matches working notebook:
+      full frame, float32, preprocess_input, no BGR→RGB conversion.
     """
 
     def __init__(self, model_path: str):
         print(f"Loading stress model from {model_path} ...")
-        self.model             = load_model_compatible(model_path, _build_stress_architecture)
-        self.mp_analyser       = _FacialStressAnalyser()
+        self.model    = load_model_compatible(model_path, _build_stress_architecture)
+        self.analyser = _ExpressionAnalyser()
+
+        # Smoothing counters
         self.stress_counter    = 0
         self.no_stress_counter = 0
         self.label             = "Detecting..."
         self.confidence        = 0.0
+
+        # Threading — model runs in background
+        self._lock          = threading.Lock()
+        self._model_pred    = 0.0      # latest model prediction
+        self._inferring     = False    # is inference currently running?
+        self._pending_frame = None     # next frame to infer
+
         print("Stress model ready.")
 
     # --------------------------------------------------
     def _preprocess(self, frame):
-        """
-        Exactly matches the working notebook's preprocess_frame():
-          - resize to 224x224
-          - float32 cast
-          - preprocess_input (scales to [-1, 1])
-          - expand dims
-        NO color conversion — notebook passes BGR frame directly.
-        """
+        """Exactly matches working notebook preprocess_frame()."""
         img = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
         img = img.astype(np.float32)
         img = preprocess_input(img)
         return np.expand_dims(img, axis=0)
 
     # --------------------------------------------------
+    def _run_inference(self, frame):
+        """Runs in background thread. Updates _model_pred when done."""
+        try:
+            inp  = self._preprocess(frame)
+            pred = float(self.model.predict(inp, verbose=0)[0][0])
+            with self._lock:
+                self._model_pred = pred
+        finally:
+            with self._lock:
+                self._inferring = False
+
+    # --------------------------------------------------
     def update(self, frame, mesh_results=None):
         """
-        Run stress inference on full frame.
-        Call every N frames (recommended: every 5).
+        Call every frame — never blocks.
+        Fires background inference thread when previous one finishes.
+        Uses last known model prediction between inference calls.
 
         Args:
-            frame        : raw BGR frame (full frame, not cropped)
-            mesh_results : FaceMesh results — used silently for borderline nudge
+            frame        : raw BGR full frame
+            mesh_results : FaceMesh results from app.py
 
         Returns:
             dict with label and confidence
         """
 
-        # ---- Primary: model on full frame ----
-        inp        = self._preprocess(frame)
-        prediction = float(self.model.predict(inp, verbose=0)[0][0])
+        # ---- Fire background inference if idle ----
+        with self._lock:
+            if not self._inferring:
+                self._inferring     = True
+                frame_copy          = frame.copy()
+                t = threading.Thread(
+                    target=self._run_inference,
+                    args=(frame_copy,),
+                    daemon=True
+                )
+                t.start()
 
-        # ---- Secondary: MediaPipe nudge (borderline only) ----
-        # Only adjusts prediction slightly when model is unsure
-        if BORDERLINE_LOW <= prediction <= BORDERLINE_HIGH:
-            mp_score = self.mp_analyser.analyse(mesh_results)
-            # mp_score > 0.5 means stress cues present → nudge up
-            # mp_score < 0.5 means calm cues → nudge down
-            nudge      = (mp_score - 0.5) * MP_NUDGE
-            prediction = float(np.clip(prediction + nudge, 0.0, 1.0))
+        # ---- Read last known model prediction (non-blocking) ----
+        with self._lock:
+            model_pred = self._model_pred
 
-        # ---- Smoothing (same as notebook) ----
-        if prediction > THRESHOLD:
+        # ---- MediaPipe expression cues ----
+        cue_count, _ = self.analyser.analyse(mesh_results)
+
+        # ---- Decision logic ----
+        # Both model AND expressions must agree (prevents false positives)
+        model_says_stress = model_pred > MODEL_THRESHOLD
+        strong_expression = cue_count >= MIN_CUES_FOR_STRESS
+        overwhelming_cues = cue_count >= MP_ONLY_THRESHOLD
+
+        is_stress = (model_says_stress and strong_expression) or overwhelming_cues
+
+        # ---- Smoothing ----
+        if is_stress:
             self.stress_counter    += 1
             self.no_stress_counter  = 0
         else:
@@ -214,10 +248,10 @@ class StressDetector:
 
         if self.stress_counter >= SMOOTHING_FRAMES:
             self.label      = "STRESS"
-            self.confidence = prediction
+            self.confidence = model_pred
         elif self.no_stress_counter >= SMOOTHING_FRAMES:
             self.label      = "NO STRESS"
-            self.confidence = 1.0 - prediction
+            self.confidence = 1.0 - model_pred
 
         return self._build_result()
 
@@ -230,25 +264,16 @@ class StressDetector:
 
     # --------------------------------------------------
     def draw(self, frame, result):
-        """
-        Draw stress label on frame.
-        Only shows STRESS / NO STRESS — no MediaPipe details.
-        """
+        """Used in standalone test only."""
         label = result["label"]
         conf  = result["confidence"]
-
-        color = (COLOR_STRESS    if label == "STRESS"     else
-                 COLOR_NO_STRESS if label == "NO STRESS"  else
-                 COLOR_DETECTING)
-
+        color = (COLOR_STRESS    if label == "STRESS"    else
+                 COLOR_NO_STRESS if label == "NO STRESS" else COLOR_DETECTING)
         text = f"Stress: {label} ({conf}%)"
         (tw, th), _ = cv2.getTextSize(text, FONT, FONT_SCALE, THICKNESS)
         cv2.rectangle(frame,
-            (LABEL_X - 6, LABEL_Y - th - 4),
-            (LABEL_X + tw + 6, LABEL_Y + 4),
-            (20, 20, 20), -1)
-        cv2.putText(frame, text, (LABEL_X, LABEL_Y),
-                    FONT, FONT_SCALE, color, THICKNESS)
+            (LABEL_X-6, LABEL_Y-th-4), (LABEL_X+tw+6, LABEL_Y+4), (20,20,20), -1)
+        cv2.putText(frame, text, (LABEL_X, LABEL_Y), FONT, FONT_SCALE, color, THICKNESS)
         return frame
 
 
@@ -258,34 +283,28 @@ if __name__ == "__main__":
     import os
     import mediapipe as mp
 
-    MODEL_PATH   = "models\\stress_model_da.h5"
+    MODEL_PATH   = os.path.join("..", "models", "stress_model_da.h5")
     mp_face_mesh = mp.solutions.face_mesh
     face_mesh    = mp_face_mesh.FaceMesh(
         max_num_faces=1, refine_landmarks=True,
-        min_detection_confidence=0.6, min_tracking_confidence=0.6
-    )
+        min_detection_confidence=0.6, min_tracking_confidence=0.6)
 
     detector    = StressDetector(MODEL_PATH)
     cap         = cv2.VideoCapture(0)
-    frame_count = 0
     last_result = detector._build_result()
 
     print("Stress Detection — Press Q to quit")
+    print("Triggers on: eye squint + brow furrow, or 4+ cues simultaneously")
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
-        frame        = cv2.flip(frame, 1)
-        rgb          = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mesh_result  = face_mesh.process(rgb)
-        frame_count += 1
-
-        if frame_count % 5 == 0:
-            last_result = detector.update(frame, mesh_result)
-
-        frame = detector.draw(frame, last_result)
+        frame       = cv2.flip(frame, 1)
+        rgb         = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mesh_result = face_mesh.process(rgb)
+        last_result = detector.update(frame, mesh_result)
+        frame       = detector.draw(frame, last_result)
         cv2.imshow("Stress Detection Test", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
