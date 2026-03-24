@@ -148,7 +148,7 @@ class EngagementDetector:
             source      = f"Blended ({int(model_conf*100)}%)"
         else:
             final_score = round(mp_score * 0.7 + model_score * 0.3)
-            source      = f"MediaPipe ({int(model_conf*100)}%)"
+            source      = f"({int(model_conf*100)}%)"
 
         final_score     = max(0, min(3, final_score))
         self.label      = SCORE_TO_LABEL[final_score]

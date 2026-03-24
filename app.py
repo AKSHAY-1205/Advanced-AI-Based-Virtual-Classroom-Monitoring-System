@@ -10,21 +10,12 @@ from modules.hand_raise import HandRaiseDetector
 from modules.stress     import StressDetector
 from modules.engagement import EngagementDetector
 
-# =====================================================
-#   VIRTUAL CLASSROOM ATTENTION MONITORING SYSTEM
-# =====================================================
 
 STRESS_MODEL_PATH     = os.path.join("models", "stress_model_da.h5")
 ENGAGEMENT_MODEL_PATH = os.path.join("models", "engagement_model_best.h5")
 
-# How often to update sidebar cards (every N frames)
-# Video runs at full speed — sidebar only updates occasionally to reduce lag
 SIDEBAR_UPDATE_EVERY  = 15
 
-# =====================================================
-#   LIGHTWEIGHT FRAME DRAWING — pure OpenCV, no PIL
-#   PIL was creating/destroying image objects every frame causing lag
-# =====================================================
 
 def _draw_label(frame, text, x, y, color, scale=0.55, thickness=1):
     """Draw a label with dark background pill. Fast OpenCV only."""
@@ -127,17 +118,11 @@ def draw_frame_overlays(frame, stress_r, engage_r, hand_r, proxy_r, mesh_results
     return frame
 
 
-# =====================================================
-#   PAGE CONFIG
-# =====================================================
 
 st.set_page_config(page_title="Virtual Classroom Monitor", layout="wide")
 st.title("Virtual Classroom Attention Monitoring System")
 st.markdown("---")
 
-# =====================================================
-#   LOAD MODELS — cached once
-# =====================================================
 
 @st.cache_resource
 def load_detectors():
@@ -165,9 +150,6 @@ def load_mediapipe():
     )
     return pose, face_detection, face_mesh
 
-# =====================================================
-#   SESSION STATE
-# =====================================================
 
 if "running" not in st.session_state:
     st.session_state.running = False
@@ -186,9 +168,6 @@ if "proxy_result" not in st.session_state:
         "static_face": False, "looking_away": False, "gaze_detail": ""
     }
 
-# =====================================================
-#   SIDEBAR
-# =====================================================
 
 st.sidebar.title("Controls")
 if st.sidebar.button(
@@ -206,9 +185,6 @@ proxy_enabled      = st.sidebar.checkbox("Proxy Detection",      value=True)
 st.sidebar.markdown("---")
 st.sidebar.info("Inference runs in background thread for smooth video.")
 
-# =====================================================
-#   LAYOUT
-# =====================================================
 
 col_video, col_status = st.columns([3, 1])
 
@@ -224,9 +200,6 @@ with col_status:
     proxy_box      = st.empty()
     proxy_flags    = st.empty()
 
-# =====================================================
-#   SIDEBAR CARD HELPERS
-# =====================================================
 
 def status_card(label, value, alert=False, neutral=False):
     color = "#888888" if neutral else ("#ff4444" if alert else "#22cc44")
@@ -414,7 +387,6 @@ if st.session_state.running:
         display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         video_placeholder.image(display_rgb, channels="RGB", width=820)
 
-        # ---- Update sidebar every N frames only ----
         if frame_count % SIDEBAR_UPDATE_EVERY == 0:
             render_sidebar(
                 st.session_state.stress_result,
