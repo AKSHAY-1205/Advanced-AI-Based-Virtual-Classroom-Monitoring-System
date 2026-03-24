@@ -3,7 +3,6 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.applications.efficientnet import preprocess_input
 
-# ================= CONSTANTS =================
 
 IMG_SIZE         = 160
 HIGH_CONF        = 0.70
@@ -30,7 +29,6 @@ COLOR_VERY_LOW   = (0, 60, 255)
 COLOR_DETECTING  = (200, 200, 200)
 
 
-# ================= COMPATIBILITY LOADER =================
 
 def _build_engagement_architecture():
     """Rebuild EfficientNetB0 engagement model architecture."""
@@ -63,7 +61,6 @@ def load_model_compatible(model_path, architecture_fn):
             raise e
 
 
-# ================= ENGAGEMENT DETECTOR =================
 
 class EngagementDetector:
     """
@@ -189,7 +186,6 @@ class EngagementDetector:
         return frame
 
 
-# ================= STANDALONE TEST =================
 
 if __name__ == "__main__":
     import os

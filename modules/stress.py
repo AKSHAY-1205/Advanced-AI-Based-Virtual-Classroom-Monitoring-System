@@ -4,58 +4,24 @@ import threading
 import tensorflow as tf
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
-# ─────────────────────────────────────────────────────────────────
-#  STRESS DETECTION — Strict Landmark-First + MobileNetV2 confirm
-#
-#  Key changes from original:
-#   1. LANDMARK GATE: All 3 core stress signals must fire before
-#      the model score is even considered:
-#        - Brow furrow (forehead/inner brow squeeze)
-#        - Eye squint  (EAR drops — eyes narrow)
-#        - Lip/mouth compression (mouth shrinks tight)
-#      This directly matches the requirement: stress only when
-#      forehead shrunken, eyebrows shrunken, lips+mouth shrunken.
-#   2. Model weight REDUCED to 0.30 — landmarks drive the decision.
-#   3. Thresholds TIGHTENED so only clear, definitive expressions
-#      trigger stress — not subtle or ambient variation.
-#   4. Smoothing window INCREASED to 10 frames — avoids false flicker.
-#   5. Fused threshold raised to 0.60 — harder to cross accidentally.
-# ─────────────────────────────────────────────────────────────────
+
 
 IMG_SIZE         = 224
-SMOOTHING_FRAMES = 10         # stable — reduces false positives
+SMOOTHING_FRAMES = 10         
+MODEL_WEIGHT     = 0.01
+CUE_WEIGHT       = 0.99
+FUSED_THRESHOLD  = 0.30       # must cross this to be labelled STRESS
 
-# Fusion weights — landmarks are PRIMARY, model is a confirming signal
-MODEL_WEIGHT     = 0.30
-CUE_WEIGHT       = 0.70
-FUSED_THRESHOLD  = 0.60       # must cross this to be labelled STRESS
-
-# ─── TIGHTENED landmark thresholds ──────────────────────────────
-#
-# BROW FURROW: inner brow landmarks 285 & 55 come close together.
-#   Normal face: inner-brow dist / face_w ≈ 0.10–0.14
-#   Furrowed    : ratio < 0.07  (was 0.08 — tightened)
 BROW_FURROW_THRESHOLD = 0.07
 
-# EYE SQUINT: Eye Aspect Ratio (EAR) drops when eyes narrow.
-#   Normal open eye EAR ≈ 0.28–0.35
-#   Squinting hard : EAR < 0.18  (was 0.20 — tightened)
 EYE_SQUINT_THRESHOLD  = 0.18
 
-# LIP COMPRESSION: inner lip gap (lm14 - lm13) / face_h very small.
-#   Relaxed mouth : ratio ≈ 0.03–0.06
-#   Pressed tight : ratio < 0.020  (was 0.022 — tightened)
 LIP_THIN_THRESHOLD    = 0.020
 
-# MOUTH SHRINK (width): corners pulled inward under stress.
-#   Normal mouth width / face_w ≈ 0.38–0.50
-#   Stress-shrunk       < 0.35
 MOUTH_WIDTH_THRESHOLD = 0.35
 
-# Nose flare — kept but not required (optional bonus cue)
 NOSE_FLARE_THRESHOLD  = 0.225
 
-# ─── Display constants ──────────────────────────────────────────
 FONT            = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE      = 0.75
 THICKNESS       = 2
@@ -65,10 +31,6 @@ COLOR_DETECTING = (200, 200, 200)
 LABEL_X         = 20
 LABEL_Y         = 285
 
-
-# ═══════════════════════════════════════════════════════════════
-#  COMPATIBILITY LOADER
-# ═══════════════════════════════════════════════════════════════
 
 def _build_stress_architecture():
     from tensorflow.keras.applications import MobileNetV2
@@ -99,9 +61,6 @@ def load_model_compatible(model_path, architecture_fn):
             raise e
 
 
-# ═══════════════════════════════════════════════════════════════
-#  MEDIAPIPE EXPRESSION ANALYSER
-# ═══════════════════════════════════════════════════════════════
 
 class _ExpressionAnalyser:
     """
@@ -147,53 +106,35 @@ class _ExpressionAnalyser:
         if face_h < 0.01 or face_w < 0.01:
             return 0.5
 
-        # ── PRIMARY STRESS SIGNALS ──────────────────────────────
-        # Must have 2 of 3 for stress to be considered at all.
-
-        # 1. BROW FURROW — inner brows pulled together
         inner_brow_dist = abs(lm[285].x - lm[55].x) / face_w
         brow_furrowed   = inner_brow_dist < BROW_FURROW_THRESHOLD
 
-        # 2. EYE SQUINT — both eyes narrow (EAR drops)
         left_ear   = self._ear(lm, 33,  160, 158, 133, 153, 144)
         right_ear  = self._ear(lm, 362, 385, 387, 263, 373, 380)
         avg_ear    = (left_ear + right_ear) / 2.0
         eyes_squinting = avg_ear < EYE_SQUINT_THRESHOLD
 
-        # 3. LIP / MOUTH COMPRESSION — lips pressed thin AND/OR mouth narrowed
-        #    lm13 = upper inner lip, lm14 = lower inner lip
         lip_gap    = abs(lm[14].y - lm[13].y) / face_h
         lips_thin  = lip_gap < LIP_THIN_THRESHOLD
 
-        #    lm61 = left mouth corner, lm291 = right mouth corner
         mouth_w    = abs(lm[291].x - lm[61].x) / face_w
         mouth_narrow = mouth_w < MOUTH_WIDTH_THRESHOLD
 
         mouth_compressed = lips_thin or mouth_narrow
 
-        # ── GATE CHECK ──────────────────────────────────────────
         primary_count = sum([brow_furrowed, eyes_squinting, mouth_compressed])
 
         if primary_count < 2:
-            # Not enough primary signals — cap score low so model can't override
             return 0.25
 
-        # ── SECONDARY / BONUS CUE ───────────────────────────────
-        # 4. Nose flare (bonus only — doesn't gate anything)
         nose_flared = abs(lm[358].x - lm[129].x) / face_w > NOSE_FLARE_THRESHOLD
 
-        # ── SCORE ASSEMBLY ──────────────────────────────────────
-        # 2 primaries → 0.60 base; 3 primaries → 0.75 base
-        # Each bonus adds 0.15; capped at 1.0
         base_score = 0.60 if primary_count == 2 else 0.75
         bonus      = 0.15 if nose_flared else 0.0
 
         return min(1.0, base_score + bonus)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  STRESS DETECTOR
-# ═══════════════════════════════════════════════════════════════
 
 class StressDetector:
     """
@@ -226,7 +167,6 @@ class StressDetector:
 
         print("Stress model ready.")
 
-    # ──────────────────────────────────────────────────────────
     def _crop_face(self, frame, mesh_results):
         """
         Crop face region from FaceMesh landmark bounding box with 25% padding.
@@ -252,14 +192,12 @@ class StressDetector:
         margin_y = int(h * 0.20)
         return frame[margin_y:h-margin_y, margin_x:w-margin_x]
 
-    # ──────────────────────────────────────────────────────────
     def _preprocess(self, img):
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
         img = img.astype(np.float32)
         img = preprocess_input(img)
         return np.expand_dims(img, axis=0)
 
-    # ──────────────────────────────────────────────────────────
     def _run_inference(self, face_crop):
         try:
             inp  = self._preprocess(face_crop)
@@ -270,7 +208,6 @@ class StressDetector:
             with self._lock:
                 self._inferring = False
 
-    # ──────────────────────────────────────────────────────────
     def update(self, frame, mesh_results=None):
         """
         Call every frame. Never blocks the video loop.
@@ -279,7 +216,6 @@ class StressDetector:
         Returns {"label": ..., "confidence": ...}
         """
 
-        # ── Face absent ──────────────────────────────────────
         face_present = (
             mesh_results is not None and
             mesh_results.multi_face_landmarks is not None and
@@ -293,7 +229,6 @@ class StressDetector:
             self.confidence        = 0.0
             return self._build_result()
 
-        # ── Fire background model inference on face crop ──────
         with self._lock:
             if not self._inferring:
                 self._inferring = True
@@ -308,17 +243,11 @@ class StressDetector:
         with self._lock:
             model_pred = self._model_pred
 
-        # ── MediaPipe landmark score (GATED) ──────────────────
         cue_score = self.analyser.analyse(mesh_results)
 
-        # ── Fused score ───────────────────────────────────────
-        # Landmarks drive 70% of the decision.
-        # If cue_score <= 0.25 (gate not met), max fused = 0.475 < 0.60
-        # → model alone can NEVER trigger stress without landmark evidence.
         fused     = MODEL_WEIGHT * model_pred + CUE_WEIGHT * cue_score
         is_stress = fused > FUSED_THRESHOLD
 
-        # ── Smoothing ─────────────────────────────────────────
         if is_stress:
             self.stress_counter    += 1
             self.no_stress_counter  = 0
@@ -332,18 +261,15 @@ class StressDetector:
         elif self.no_stress_counter >= SMOOTHING_FRAMES:
             self.label      = "NO STRESS"
             self.confidence = 1.0 - fused
-        # else: keep previous label (stable during transition)
 
         return self._build_result()
 
-    # ──────────────────────────────────────────────────────────
     def _build_result(self):
         return {
             "label"     : self.label,
             "confidence": round(self.confidence * 100, 1)
         }
 
-    # ──────────────────────────────────────────────────────────
     def draw(self, frame, result):
         """Standalone test only."""
         label = result["label"]
@@ -357,10 +283,6 @@ class StressDetector:
         cv2.putText(frame, text, (LABEL_X, LABEL_Y), FONT, FONT_SCALE, color, THICKNESS)
         return frame
 
-
-# ═══════════════════════════════════════════════════════════════
-#  STANDALONE TEST
-# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import os

@@ -285,10 +285,6 @@ def render_waiting():
                                       "Looking Away"  : False}),
         unsafe_allow_html=True)
 
-# =====================================================
-#   ENGAGEMENT BACKGROUND THREAD
-#   (same pattern as stress — non-blocking)
-# =====================================================
 
 global _engage_running
 _engage_lock    = threading.Lock()
@@ -305,10 +301,6 @@ def _run_engagement(engage_det, frame, mesh_results):
         with _engage_lock:
             _engage_running = False
 
-# =====================================================
-#   MAIN LOOP
-# =====================================================
-
 if st.session_state.running:
     stress_det, engage_det, proxy_det, hand_det = load_detectors()
     pose, face_detection, face_mesh             = load_mediapipe()
@@ -321,7 +313,6 @@ if st.session_state.running:
         st.session_state.running = False
         st.stop()
 
-    # Lower camera resolution for smoother streaming
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -340,24 +331,19 @@ if st.session_state.running:
         rgb          = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_count += 1
 
-        # ---- MediaPipe every frame (fast, GPU-optimised) ----
         pose_results = pose.process(rgb)
         det_results  = face_detection.process(rgb)
         mesh_results = face_mesh.process(rgb)
 
-        # ---- Hand Raise — every frame (instant) ----
         if handrise_enabled:
             st.session_state.handrise_result = hand_det.update(pose_results, h)
 
-        # ---- Proxy — every frame (instant) ----
         if proxy_enabled:
             st.session_state.proxy_result = proxy_det.update(det_results, mesh_results)
 
-        # ---- Stress — every frame, non-blocking (fires thread internally) ----
         if stress_enabled:
             st.session_state.stress_result = stress_det.update(frame, mesh_results)
 
-        # ---- Engagement — background thread, fires every 10 frames ----
         if engagement_enabled and frame_count % 10 == 0:
             with _engage_lock:
                 is_running = _engage_running
@@ -373,7 +359,6 @@ if st.session_state.running:
             with _engage_lock:
                 st.session_state.engagement_result = _engage_result
 
-        # ---- Draw overlays on frame (pure OpenCV, fast) ----
         display = draw_frame_overlays(
             frame.copy(),
             st.session_state.stress_result,
@@ -383,7 +368,6 @@ if st.session_state.running:
             mesh_results
         )
 
-        # ---- Show frame — fixed width, no deprecated params ----
         display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         video_placeholder.image(display_rgb, channels="RGB", width=820)
 

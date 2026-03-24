@@ -1,7 +1,6 @@
 import cv2
 import mediapipe as mp
 
-# ================= CONSTANTS =================
 
 VISIBILITY_THRESHOLD = 0.5
 PALM_RAISE_THRESHOLD = 10    # wrist above elbow by this many pixels = palm raise
@@ -16,7 +15,6 @@ LABEL_X      = 20
 LABEL_Y      = 240
 
 
-# ================= HAND RAISE DETECTOR =================
 
 class HandRaiseDetector:
     """
@@ -61,7 +59,6 @@ class HandRaiseDetector:
         def vis(lmk):
             return lmk.visibility > VISIBILITY_THRESHOLD
 
-        # After cv2.flip(frame,1): MediaPipe LEFT → appears on screen RIGHT
         checks = [
             (lm[mp.solutions.pose.PoseLandmark.LEFT_WRIST],
              lm[mp.solutions.pose.PoseLandmark.LEFT_ELBOW],
@@ -109,15 +106,13 @@ class HandRaiseDetector:
 
         return self._build_result()
 
-    # --------------------------------------------------
     def _build_result(self):
         return {
             "hand_raised": self.hand_raised,
-            "raise_type" : self.raise_type,   # "Palm Raise" / "Arm Raise" / None
-            "hand_side"  : self.hand_side      # "Left" / "Right" / "Both" / None
+            "raise_type" : self.raise_type,   
+            "hand_side"  : self.hand_side      
         }
 
-    # --------------------------------------------------
     def draw(self, frame, result):
         if result["hand_raised"]:
             text  = f"Hand Raised: {result['raise_type']} ({result['hand_side']})"
@@ -136,7 +131,6 @@ class HandRaiseDetector:
         return frame
 
 
-# ================= STANDALONE TEST =================
 
 if __name__ == "__main__":
     mp_pose = mp.solutions.pose

@@ -3,7 +3,6 @@ import numpy as np
 import time
 import mediapipe as mp
 
-# ================= CONSTANTS =================
 
 FACE_ABSENCE_LIMIT   = 5
 STATIC_FRAME_LIMIT   = 200
@@ -19,7 +18,6 @@ BLINK_RESET_FRAMES   = 4
 
 PROXY_SCORE_LIMIT    = 3
 
-# Display (used in standalone test only — app.py uses PIL)
 LABEL_X          = 20
 LABEL_START_Y    = 40
 LABEL_SPACING    = 34
@@ -33,7 +31,6 @@ COLOR_PROXY_BG   = (0, 0, 180)
 COLOR_WHITE      = (255, 255, 255)
 
 
-# ================= HELPERS =================
 
 def _ear(lm, p1, p2, p3, p4, p5, p6):
     v1 = np.linalg.norm([lm[p2].x - lm[p6].x, lm[p2].y - lm[p6].y])
@@ -41,8 +38,6 @@ def _ear(lm, p1, p2, p3, p4, p5, p6):
     h  = np.linalg.norm([lm[p1].x - lm[p4].x, lm[p1].y - lm[p4].y])
     return (v1 + v2) / (2.0 * h + 1e-6)
 
-
-# ================= PROXY DETECTOR =================
 
 class ProxyDetector:
     """
@@ -78,12 +73,8 @@ class ProxyDetector:
         self.proxy_detected   = False
         self.proxy_score      = 0
 
-    # --------------------------------------------------
     def update(self, detection_results, mesh_results):
 
-        # ---- Face presence — purely from FaceMesh ----
-        # If FaceMesh returns ANY landmarks → face is present, period.
-        # No additional validation — FaceMesh is already robust.
         face_count = 0
         if (mesh_results is not None and
                 mesh_results.multi_face_landmarks is not None):
